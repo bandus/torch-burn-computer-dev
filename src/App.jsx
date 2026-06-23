@@ -204,6 +204,7 @@ function BurnCalculatorInner() {
   // ── Intercept state — origin/destination bodies (URL → LS) ──
   const [originBody, setOriginBody] = useState(() => _ul('ob', 'pa_origin_body', '1036 Ganymed'));
   const [destBody, setDestBody] = useState(() => _ul('db', 'pa_dest_body', ''));
+  const [icBudget, setIcBudget] = useState(() => _up('icb') ?? '');
 
   // ── Final Approach state — per-burn fields from URL only, vessel/prefs from URL→LS ──
   const [faDistance, setFaDistance] = useState(() => _up('fad') ?? '');
@@ -275,6 +276,7 @@ function BurnCalculatorInner() {
     if (faGameStart) p.set('fgt', faGameStart);
     if (originBody && originBody !== '1036 Ganymed') p.set('ob', originBody);
     if (destBody) p.set('db', destBody);
+    if (icBudget) p.set('icb', icBudget);
     const qs = p.toString();
     try {
       history.replaceState(
@@ -288,7 +290,7 @@ function BurnCalculatorInner() {
     vArrival, vArrivalUnit, vcrs, vcrsUnit, noWakeEnabled, standoffKm, targetDuration,
     burnPreference, gameStartTime, faDistance, faDistanceUnit, faVrel, faVrelUnit,
     faAccel, faBudget, faVArrival, faVArrivalUnit, faGameStart, appMode,
-    originBody, destBody,
+    originBody, destBody, icBudget,
   ]);
 
   // ── localStorage sync — vessel params and preferences only ───────────────
@@ -308,10 +310,11 @@ function BurnCalculatorInner() {
     _lsSave('pa_fvau', faVArrivalUnit !== 'm/s' ? faVArrivalUnit : null);
     _lsSave('pa_origin_body', originBody !== '1036 Ganymed' ? originBody || null : null);
     _lsSave('pa_dest_body', destBody || null);
+    _lsSave('pa_ic_budget', icBudget || null);
   }, [
     accel, faAccel, flipTime, burnPreference, noWakeEnabled, standoffKm,
     distanceUnit, v0Unit, vArrivalUnit, vcrsUnit, faDistanceUnit, faVrelUnit, faVArrivalUnit,
-    originBody, destBody,
+    originBody, destBody, icBudget,
   ]);
 
   // ── mode switch — copies shared fields (range, vrel) on transition ────────
@@ -454,18 +457,29 @@ function BurnCalculatorInner() {
   }
 
   function handleInterceptCopy() {
-    if (!interceptResult || interceptResult.error) return;
+    if (!interceptOk || ic_budgetInsufficient) return;
     const lines = [];
     lines.push('── INTERCEPT ──');
     lines.push(`Origin: ${originBody}`);
     lines.push(`Destination: ${destBody}`);
     lines.push(`Current Time: ${gameStartTime}`);
+    if (icBudget.trim() !== '') lines.push(`Reactant Budget: ${icBudget}`);
     lines.push('');
     lines.push('── INTERCEPT SOLUTION ──');
-    lines.push(`Bearing: ${interceptResult.bearing_deg.toFixed(2)}° (HANDEDNESS UNCONFIRMED)`);
-    lines.push(`Range at Intercept: ${formatDistance(interceptResult.range_m)}`);
-    lines.push(`Travel Time: ${formatTargetDuration(Math.floor(interceptResult.deltaT_s)) ?? '0S'}`);
-    if (ic_arriveTarget) lines.push(`Arrival: ${formatGameTime(ic_arriveTarget)}`);
+    lines.push(`Bearing: ${interceptResult.bearing_deg.toFixed(2)}°`);
+    lines.push(`Travel Distance: ${formatDistance(interceptResult.range_m)}`);
+    lines.push(`${ic_isDriftMode ? 'End Accel / Begin Flip' : 'Begin Flip'}: ${ic_flipTarget ? formatGameTime(ic_flipTarget) : (formatTargetDuration(Math.floor(ic_finalPlan.t_accel)) ?? '0S')}`);
+    if (ic_isDriftMode) {
+      lines.push(`End Drift / Begin Brake: ${ic_brakeTarget ? formatGameTime(ic_brakeTarget) : (formatTargetDuration(Math.floor(ic_finalPlan.t_accel + ic_finalPlan.t_rotate + (ic_finalPlan.t_drift || 0))) ?? '0S')}`);
+    } else {
+      lines.push(`Begin Brake: ${ic_brakeTarget ? formatGameTime(ic_brakeTarget) : (formatTargetDuration(Math.floor(ic_finalPlan.t_accel + ic_finalPlan.t_rotate)) ?? '0S')}`);
+    }
+    lines.push(`Arrival: ${ic_arriveTarget ? formatGameTime(ic_arriveTarget) : (formatTargetDuration(Math.floor(ic_finalPlan.t_total)) ?? '0S')}`);
+    lines.push('');
+    lines.push(`Accel: ${formatTargetDuration(Math.floor(ic_finalPlan.t_accel)) ?? '0S'}`);
+    if (ic_isDriftMode) lines.push(`Drift: ${formatTargetDuration(Math.floor(ic_finalPlan.t_drift || 0)) ?? '0S'}`);
+    lines.push(`Brake: ${formatTargetDuration(Math.floor(ic_finalPlan.t_brake)) ?? '0S'}`);
+    lines.push(`Peak Velocity: ${formatVelocity(ic_finalPlan.v_max)}`);
     navigator.clipboard.writeText(lines.join('\n')).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
@@ -848,12 +862,56 @@ function BurnCalculatorInner() {
         })
       : null;
   const interceptOk = !!(interceptResult && !interceptResult.error);
+
+  // Intercept drift plan — budget constrains v_max, engaging drift phase if needed.
+  const ic_budget_s = (() => {
+    const parsed = parseTargetDuration(icBudget);
+    return parsed !== null && parsed > 0 ? parsed : null;
+  })();
+
+  let ic_driftPlan = null;
+  if (ic_budget_s !== null && interceptOk) {
+    const base = interceptResult.plan;
+    const v_max_budget = (ic_accel_mps2 * ic_budget_s + ic_v0_mps + ic_v_arrival_mps) / 2;
+    if (v_max_budget >= base.v_max) {
+      // Budget exceeds requirement — standard plan, no drift needed
+    } else if (v_max_budget <= ic_v0_mps || v_max_budget <= ic_v_arrival_mps) {
+      ic_driftPlan = { error: 'BUDGET INSUFFICIENT — CANNOT BRAKE TO TARGET VELOCITY' };
+    } else {
+      const p = buildDriftPlan({
+        distance_m: interceptResult.range_m,
+        v0_mps: ic_v0_mps,
+        a_mps2: ic_accel_mps2,
+        v_arrival_mps: ic_v_arrival_mps,
+        t_rotate_s,
+        v_max: v_max_budget,
+      });
+      if (p) ic_driftPlan = p;
+    }
+  }
+
+  const ic_hasDriftPlan = !!(ic_driftPlan && !ic_driftPlan.error);
+  const ic_finalPlan = ic_hasDriftPlan ? ic_driftPlan : (interceptOk ? interceptResult.plan : null);
+  const ic_isDriftMode = ic_hasDriftPlan;
+  const ic_budgetInsufficient = !!(ic_driftPlan && ic_driftPlan.error);
+
+  const ic_flipTarget =
+    interceptOk && ic_finalPlan && ic_hasFullDate
+      ? addGameTime(parsedGameTime, ic_finalPlan.t_accel)
+      : null;
+  const ic_brakeTarget =
+    interceptOk && ic_finalPlan && ic_hasFullDate
+      ? addGameTime(parsedGameTime, ic_finalPlan.t_accel + ic_finalPlan.t_rotate + (ic_isDriftMode ? (ic_finalPlan.t_drift || 0) : 0))
+      : null;
   const ic_arriveTarget =
-    interceptOk && ic_hasFullDate ? addGameTime(parsedGameTime, interceptResult.deltaT_s) : null;
+    interceptOk && ic_finalPlan && ic_hasFullDate
+      ? addGameTime(parsedGameTime, ic_finalPlan.t_total)
+      : null;
+
   const interceptStatus = ic_sameBody
     ? 'INVALID'
     : interceptResult
-      ? interceptResult.error
+      ? interceptResult.error || ic_budgetInsufficient
         ? 'INVALID'
         : 'READY'
       : 'STANDBY';
@@ -865,7 +923,7 @@ function BurnCalculatorInner() {
     appMode === 'approach'
       ? faPlan && (faPlan.error || fa_noWakeError)
       : appMode === 'intercept'
-        ? ic_sameBody || !!(interceptResult && interceptResult.error)
+        ? ic_sameBody || !!(interceptResult && interceptResult.error) || ic_budgetInsufficient
         : plan.error || noWakeError || !!(driftPlan && driftPlan.error);
   const activeIsOvershoot =
     appMode === 'approach'
@@ -1459,6 +1517,16 @@ function BurnCalculatorInner() {
                     units={[]}
                     placeholder="e.g. 60"
                     invalid={flipTime.trim() === ''}
+                  />
+                  <InputRow
+                    label="Reactant Budget"
+                    value={icBudget}
+                    onChange={setIcBudget}
+                    units={[]}
+                    placeholder="e.g. 4d 3h 2m 37s"
+                    tooltip={{
+                      desc: 'Maximum thrust time available. When set, limits peak velocity and adds a drift phase to stay within budget. Leave blank for unconstrained.',
+                    }}
                   />
 
                   {/* ── Game Clock ── */}
@@ -2160,27 +2228,83 @@ function BurnCalculatorInner() {
                         highlight
                         flickerKey={flickerKey}
                       />
-                      <div
-                        className="bc-field-note"
-                        style={{ color: 'var(--amber)', marginBottom: 12 }}
-                      >
-                        ⚠ BEARING HANDEDNESS UNCONFIRMED — VALIDATE IN-GAME BEFORE RELYING ON IT
-                      </div>
                       <Readout
-                        label="RANGE AT INTERCEPT"
+                        label="TRAVEL DISTANCE"
                         value={formatDistance(interceptResult.range_m)}
                         flickerKey={flickerKey}
                       />
-                      <Readout
-                        label="TRAVEL TIME (Δt)"
-                        value={formatTargetDuration(Math.floor(interceptResult.deltaT_s)) ?? '0S'}
-                        flickerKey={flickerKey}
-                      />
-                      <Readout
-                        label="ARRIVAL"
-                        value={ic_arriveTarget ? formatGameTime(ic_arriveTarget) : '—'}
-                        flickerKey={flickerKey}
-                      />
+
+                      {ic_budgetInsufficient && (
+                        <div className="bc-warning" role="alert">
+                          <AlertTriangle size={14} color="var(--red)" />
+                          <div className="bc-warning-text">
+                            <strong>BUDGET INSUFFICIENT — CANNOT BRAKE TO TARGET VELOCITY</strong>
+                            <br />
+                            Increase reactant budget or lower closing / arrival velocity.
+                          </div>
+                        </div>
+                      )}
+
+                      {!ic_budgetInsufficient && (
+                        <>
+                          <Readout
+                            label={ic_isDriftMode ? 'End Accel / Begin Flip' : 'Begin Flip'}
+                            value={
+                              ic_flipTarget
+                                ? formatGameTime(ic_flipTarget)
+                                : `T+${formatTargetDuration(Math.floor(ic_finalPlan.t_accel)) ?? '0S'}`
+                            }
+                            highlight
+                            flickerKey={flickerKey}
+                          />
+                          {ic_isDriftMode ? (
+                            <Readout
+                              label="End Drift / Begin Brake"
+                              value={
+                                ic_brakeTarget
+                                  ? formatGameTime(ic_brakeTarget)
+                                  : `T+${formatTargetDuration(Math.floor(ic_finalPlan.t_accel + ic_finalPlan.t_rotate + (ic_finalPlan.t_drift || 0))) ?? '0S'}`
+                              }
+                              highlight
+                              flickerKey={flickerKey}
+                            />
+                          ) : (
+                            <Readout
+                              label="Begin Brake"
+                              value={
+                                ic_brakeTarget
+                                  ? formatGameTime(ic_brakeTarget)
+                                  : `T+${formatTargetDuration(Math.floor(ic_finalPlan.t_accel + ic_finalPlan.t_rotate)) ?? '0S'}`
+                              }
+                              highlight
+                              flickerKey={flickerKey}
+                            />
+                          )}
+                          <Readout
+                            label="Arrival"
+                            value={
+                              ic_arriveTarget
+                                ? formatGameTime(ic_arriveTarget)
+                                : `T+${formatTargetDuration(Math.floor(ic_finalPlan.t_total)) ?? '0S'}`
+                            }
+                            flickerKey={flickerKey}
+                          />
+                          <div
+                            className="bc-field-note"
+                            style={{ textAlign: 'right', marginTop: 4, marginBottom: 8 }}
+                          >
+                            ACCEL {formatTargetDuration(Math.floor(ic_finalPlan.t_accel)) ?? '0S'}
+                            {ic_isDriftMode && ` · DRIFT ${formatTargetDuration(Math.floor(ic_finalPlan.t_drift || 0)) ?? '0S'}`}
+                            {' · BRAKE '}
+                            {formatTargetDuration(Math.floor(ic_finalPlan.t_brake)) ?? '0S'}
+                          </div>
+                          <Readout
+                            label="PEAK VELOCITY"
+                            value={formatVelocity(ic_finalPlan.v_max)}
+                            flickerKey={flickerKey}
+                          />
+                        </>
+                      )}
                     </>
                   )}
                 </div>
